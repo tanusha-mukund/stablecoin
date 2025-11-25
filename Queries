@@ -1,0 +1,415 @@
+QUERY 1-
+Question:
+How many unique wallets are active with USDC each day over the past 180 days on Ethereum, counting 
+any address that either sends or receives USDC?
+Main logic:
+1) Build a list of all USDC wallets by day from the transfer table, treating both senders ("from") and 
+receivers ("to") as active wallets.
+2) Union these two sides into a single wallet list (CTE usdc_wallets).
+3) Aggregate by day to count distinct active wallets per day (CTE daily_activity), then select and order the 
+final daily series.
+The queryWITH usdc_wallets AS (
+ -- Senders
+ SELECT
+ date_trunc('day', evt_block_time) AS day,
+ "from" AS wallet
+ FROM erc20_ethereum.evt_Transfer
+ WHERE contract_address = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
+ AND evt_block_time >= CURRENT_TIMESTAMP - INTERVAL '180' DAY
+ UNION ALL
+ -- Receivers
+ SELECT
+ date_trunc('day', evt_block_time) AS day,
+ "to" AS wallet
+ FROM erc20_ethereum.evt_Transfer
+ WHERE contract_address = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
+ AND evt_block_time >= CURRENT_TIMESTAMP - INTERVAL '180' DAY
+),
+daily_activity AS (
+ SELECT
+ day,
+ COUNT(DISTINCT wallet) AS active_wallets
+ FROM usdc_wallets
+ GROUP BY 1
+)
+SELECT
+ day,
+ active_wallets
+FROM daily_activity
+ORDER BY day;
+QUERY 2-
+Question:
+For USDC over the last 90 days, how much USDC has flowed in and out of each labeled entity type (cex, 
+dex, lending, bridge, treasury_multisig), and what is the net inflow by entity type?
+Main logic:
+1) Pull all recent USDC transfers and normalize value to USDC units (CTE usdc_transfers).
+2) Load address labels and build a simplified entity mapping with a coarse entity_type classification 
+(CTEs raw_labels, entities).
+3) For each address, sum total USDC in and out, and compute net inflow by combining sender and
+receiver views (CTE address_flows).
+4) Attach entity labels to flows, keeping unlabeled addresses explicit (CTE flows_with_labels).
+5) Aggregate by entity_type to get total in, out, and net inflow (CTE entity_type_agg).
+6) In the final SELECT, filter to the key entity types (cex, dex, lending, bridge, treasury_multisig) and order 
+by total USDC in.
+Query:
+WITH usdc_transfers AS (
+ SELECT
+ "from" AS from_addr,
+ "to" AS to_addr,
+ value / 1e6 AS usdc_amount -- USDC has 6 decimals
+ FROM erc20_ethereum.evt_Transfer
+ WHERE contract_address = FROM_HEX('A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48') -- USDC
+ AND evt_block_time >= current_timestamp - INTERVAL '90' DAY
+),
+raw_labels AS (
+ SELECT DISTINCT
+ address,
+ name,
+ category
+ FROM labels.addresses
+ WHERE blockchain = 'ethereum'
+),
+entities AS (
+ SELECT
+ address,
+ name AS entity,
+ /* VERY light classification; everything else is just "other_labeled" */
+ CASE
+ WHEN name LIKE '%binance%' THEN 'cex'
+ WHEN name LIKE '%coinbase%' THEN 'cex'
+ WHEN name LIKE '%kraken%' THEN 'cex'
+ WHEN name LIKE '%bitfinex%' THEN 'cex'
+ WHEN name LIKE '%okx%' THEN 'cex'
+ WHEN name LIKE '%uniswap%' THEN 'dex'
+ WHEN name LIKE '%curve%' THEN 'dex'
+ WHEN name LIKE '%balancer%' THEN 'dex'
+ WHEN name LIKE '%aave%' THEN 'lending'
+ WHEN name LIKE '%compound%' THEN 'lending'
+ WHEN name LIKE '%morpho%' THEN 'lending'
+ WHEN name LIKE '%maker%' THEN 'lending'
+ WHEN name LIKE '%bridge%' THEN 'bridge'
+ WHEN name LIKE '%erc20predicate%' THEN 'bridge'
+ WHEN name LIKE '%safe%' THEN 'treasury_multisig'
+ ELSE 'other_labeled'
+ END AS entity_type
+ FROM raw_labels
+),
+-- 1) Build a per-address view of total in / out
+address_flows AS (
+ SELECT
+ addr,
+ SUM(usdc_in) AS usdc_in,
+ SUM(usdc_out) AS usdc_out,
+ SUM(usdc_in) - SUM(usdc_out) AS net_inflow
+ FROM (
+ SELECT
+ to_addr AS addr,
+ usdc_amount AS usdc_in,
+ 0 AS usdc_out
+ FROM usdc_transfers
+ UNION ALL
+ SELECT
+ from_addr AS addr,
+ 0 AS usdc_in,
+ usdc_amount AS usdc_out
+ FROM usdc_transfers
+ ) t
+ GROUP BY addr
+),
+-- 2) Attach labels where we have them; keep unlabeled explicitly
+flows_with_labels AS (
+ SELECT
+ f.addr,
+ COALESCE(e.entity, LOWER(TO_HEX(f.addr))) AS entity,
+ COALESCE(e.entity_type, 'unlabeled') AS entity_type,
+ f.usdc_in,
+ f.usdc_out,
+ f.net_inflow
+ FROM address_flows f
+ LEFT JOIN entities e
+ ON f.addr = e.address
+),
+-- 3) Aggregate by entity_type first
+entity_type_agg AS (
+ SELECT
+ entity_type,
+ SUM(usdc_in) AS total_usdc_in,
+ SUM(usdc_out) AS total_usdc_out,
+ SUM(net_inflow) AS total_net_inflow,
+ SUM(GREATEST(net_inflow, 0)) AS positive_net_inflow
+ FROM flows_with_labels
+ GROUP BY entity_type
+)
+-- 4) Now compute the share in an outer query
+-- starting from entity_type_agg CTE you already have
+SELECT
+ entity_type,
+ total_usdc_in,
+ total_usdc_out,
+ total_net_inflow
+FROM entity_type_agg
+WHERE entity_type IN ('cex','dex','lending','bridge','treasury_multisig')
+ORDER BY total_usdc_in DESC;
+QUERY 3-
+Question:
+Among labeled receivers of USDC on Ethereum in the last 90 days, how much volume goes to centralized 
+exchanges vs DeFi/protocol contracts, and what share of labeled USDC volume each platform type 
+accounts for?
+Main logic
+1. Pull all USDC transfers in the last 90 days and convert raw value to USDC units.
+2. Select labeled CEX addresses (Binance, Coinbase, etc.) and tag them as “exchange”.
+3. Select labeled contract addresses that look like DeFi/protocol contracts, filtering out 
+generic/noisy labels.
+4. Combine CEX and DeFi entities into a single labeled-entity table.
+5. Aggregate total USDC received per address.
+6. Join receivers to the entity table and keep only labeled ones, assigning each a platform type.
+7. Group by platform type and compute total USDC received and the percentage share of labeled 
+volume
+Query:
+WITH usdc_transfers AS (
+ SELECT
+ "from",
+ "to",
+ value / 1e6 AS usdc_amount
+ FROM erc20_ethereum.evt_Transfer
+ WHERE contract_address = FROM_HEX('A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48') -- USDC
+ AND evt_block_time >= current_timestamp - INTERVAL '90' DAY
+),
+cex_entities AS (
+ SELECT DISTINCT
+ address,
+ name AS entity,
+ 'exchange' AS entity_type
+ FROM labels.addresses
+ WHERE blockchain = 'ethereum'
+ AND name IS NOT NULL
+ AND (
+ LOWER(name) LIKE '%binance%' OR
+ LOWER(name) LIKE '%coinbase%' OR
+ LOWER(name) LIKE '%kraken%' OR
+ LOWER(name) LIKE '%bitfinex%' OR
+ LOWER(name) LIKE '%okx%'
+ )
+),
+defi_entities AS (
+ SELECT DISTINCT
+ address,
+ name AS entity,
+ category AS entity_type
+ FROM labels.addresses
+ WHERE blockchain = 'ethereum'
+ AND category = 'contracts'
+ AND name IS NOT NULL
+ AND LOWER(name) NOT LIKE '%trader%'
+ AND LOWER(name) NOT LIKE '%user%'
+ AND LOWER(name) NOT LIKE 'number of%'
+ AND LOWER(name) NOT LIKE '%avg%'
+ AND LOWER(name) NOT LIKE '%months%'
+ AND LOWER(name) NOT LIKE '%years%'
+ AND LOWER(name) NOT LIKE '%wallet%'
+),
+entities AS (
+ SELECT * FROM cex_entities
+ UNION ALL
+ SELECT * FROM defi_entities
+),
+usdc_receivers AS (
+ SELECT
+ "to" AS address,
+ SUM(usdc_amount) AS usdc_received
+ FROM usdc_transfers
+ GROUP BY 1
+),
+labeled_receivers AS (
+ SELECT
+ COALESCE(e.entity_type, 'unknown') AS entity_type,
+ usdc_received
+ FROM usdc_receivers r
+ LEFT JOIN entities e ON r.address = e.address
+ WHERE e.entity IS NOT NULL
+)
+SELECT
+ CASE 
+ WHEN entity_type = 'contracts' THEN 'DeFi / Protocol contracts'
+ ELSE entity_type
+ END AS platform_type,
+ SUM(usdc_received) AS total_usdc_received,
+ SUM(usdc_received)*100
+ / SUM(SUM(usdc_received)) OVER () AS share_of_labeled_volume
+FROM labeled_receivers
+GROUP BY 1
+ORDER BY total_usdc_received DESC;
+QUERY 4-
+Question:
+For USDC and USDT on Ethereum over the last 180 days, how many distinct wallets are active each week 
+for each token, and what share of total active wallets belongs to each token in each week?
+Main logic
+1. Define the USDC and USDT contract addresses and symbols.
+2. Collect all “from” and “to” addresses for transfers of either token, bucketed by week and tagged 
+with the token symbol.
+3. For each (week, token) pair, count distinct wallets to get weekly active wallets, then compute 
+wallet_share as that count divided by the total distinct-wallet count across both tokens in that 
+week.
+Query:
+WITH tokens AS ( 
+SELECT 0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48 AS contract_address, 
+'USDC' AS symbol 
+UNION ALL 
+SELECT 0xdac17f958d2ee523a2206206994597c13d831ec7 AS contract_address, 
+'USDT' AS symbol 
+), 
+wallets AS ( 
+-- from side 
+SELECT 
+date_trunc('week', evt_block_time) AS week, t.symbol, 
+"from" AS wallet 
+FROM erc20_ethereum.evt_Transfer e 
+JOIN tokens t 
+ON e.contract_address = t.contract_address 
+WHERE evt_block_time >= now() - interval '180' day 
+UNION 
+-- to side 
+SELECT 
+date_trunc('week', evt_block_time) AS week, 
+t.symbol, "to" AS wallet 
+FROM erc20_ethereum.evt_Transfer e 
+JOIN tokens t 
+ON e.contract_address = t.contract_address 
+WHERE evt_block_time >= now() - interval '180' day 
+) 
+SELECT 
+week, 
+symbol, 
+COUNT(DISTINCT wallet) AS weekly_active_wallets, 
+CAST(COUNT(DISTINCT wallet) AS DOUBLE) / SUM(CAST(COUNT(DISTINCT wallet) AS DOUBLE)) 
+OVER (PARTITION BY week) AS wallet_share 
+FROM wallets 
+GROUP BY week, symbol 
+ORDER BY week, symbol;
+QUERY 5-
+Question:
+For USDC and USDT on Ethereum over the last 90 days, what fraction of total transactions is generated by 
+the top ~1% of wallets (by transaction count), and how concentrated is activity in those “power users” for 
+each token?
+Main logic:
+1. Define USDC and USDT contract addresses.
+2. For each wallet (sender) and token, count the number of transfers in the last 90 days.
+3. Rank wallets by transaction count per token and compute the total wallet count per token.
+4. Compute top_n = ceiling(1% of total wallets) and flag wallets whose rank is within that top_n.
+5. For each token, sum transaction counts from top-1% wallets vs all wallets and compute the 
+share of total transactions generated by the top 1% wallets.
+6. Map contract addresses back to token symbols and present total vs top-1% transactions and the 
+percentage share.
+Query:
+WITH tokens AS (
+ SELECT FROM_HEX('a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48') AS contract_address, 'USDC' 
+AS symbol UNION ALL
+ SELECT FROM_HEX('dac17f958d2ee523a2206206994597c13d831ec7') AS contract_address, 'USDT' AS 
+symbol
+),
+base AS (
+ -- count txs per wallet (sender side) for each token in a recent window
+ SELECT
+ e.contract_address,
+ "from" AS wallet,
+ COUNT(*) AS tx_count
+ FROM erc20_ethereum.evt_Transfer e
+ JOIN tokens t ON e.contract_address = t.contract_address
+ WHERE e.evt_block_time >= current_timestamp - INTERVAL '90' DAY
+ GROUP BY 1,2
+),
+ranked1 AS (
+ -- compute rank per wallet and total wallet count per token
+ SELECT
+ contract_address,
+ wallet,
+ tx_count,
+ row_number() OVER (PARTITION BY contract_address ORDER BY tx_count DESC) AS rn,
+ count(*) OVER (PARTITION BY contract_address) AS total_wallets
+ FROM base
+),
+ranked2 AS (
+ -- top_n = ceil(total_wallets * 0.01) so we robustly pick top 1%
+ SELECT
+ contract_address,
+ wallet,
+ tx_count,
+ rn,
+ total_wallets,
+ CAST(CEIL(total_wallets * 0.01) AS BIGINT) AS top_n,
+ CASE WHEN rn <= CAST(CEIL(total_wallets * 0.01) AS BIGINT) THEN 1 ELSE 0 END AS is_top1
+ FROM ranked1
+),
+aggregated AS (
+ SELECT
+ contract_address,
+ SUM(CASE WHEN is_top1 = 1 THEN tx_count ELSE 0 END) AS top1_tx,
+ SUM(tx_count) AS total_tx,
+ SUM(CASE WHEN is_top1 = 1 THEN tx_count ELSE 0 END) * 1.0 / NULLIF(SUM(tx_count),0) AS 
+pct_top_1_wallets
+ FROM ranked2
+ GROUP BY contract_address
+)
+SELECT
+ CASE WHEN a.contract_address = FROM_HEX('a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48') 
+THEN 'USDC'
+ WHEN a.contract_address = FROM_HEX('dac17f958d2ee523a2206206994597c13d831ec7') THEN 
+'USDT'
+ ELSE LOWER(TO_HEX(a.contract_address))
+ END AS token,
+ a.top1_tx,
+ a.total_tx,
+ ROUND(a.pct_top_1_wallets * 100, 3) AS pct_top_1_wallets -- percent with 3 decimals
+FROM aggregated a
+ORDER BY pct_top_1_wallets DESC;
+QUERY 6-
+Question:
+For USDC and USDT on Ethereum over the last 60 days, how are transactions distributed across different 
+size buckets (e.g., $1–10, $10–100, $100–1k, etc.), and how do USDC and USDT compare by count and 
+volume in each bucket?
+Main logic:
+1. Select transfers for USDC and USDT in the last 60 days, convert raw values to token units (≈ 
+USD), and sample up to 500k rows to avoid timeouts.
+2. Assign each transfer to a transaction-size bucket based on its dollar value (e.g., $1–10, $10–100, 
+$100–1k, etc.).
+3. Group by token and size bucket to compute both the number of transactions and total volume for 
+each token in each bucket.
+Query:
+WITH stablecoin_tx AS (
+ SELECT
+ CASE
+ WHEN contract_address = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 THEN 'USDC'
+ WHEN contract_address = 0xdAC17F958D2ee523a2206206994597C13D831ec7 THEN 'USDT'
+ END AS token,
+ value / 1e6 AS tx_size_tokens -- 6 decimals, ≈ USD
+ FROM erc20_ethereum.evt_Transfer
+ WHERE contract_address IN (
+ 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48, -- USDC
+ 0xdAC17F958D2ee523a2206206994597C13D831ec7 -- USDT
+ )
+ AND evt_block_time >= CURRENT_TIMESTAMP - INTERVAL '60' DAY
+ AND value > 0
+ LIMIT 500000 -- sample to avoid timeouts
+),
+bucketed AS (
+ SELECT
+ token,
+ CASE
+ WHEN tx_size_tokens < 10 THEN '01: $1–10'
+ WHEN tx_size_tokens < 100 THEN '02: $10–100'
+ WHEN tx_size_tokens < 1000 THEN '03: $100–1k'
+ WHEN tx_size_tokens < 10000 THEN '04: $1k–10k'
+ WHEN tx_size_tokens < 100000 THEN '05: $10k–100k'
+ ELSE '06: >$100k'
+ END AS size_bucket,
+ tx_size_tokens
+ FROM stablecoin_tx
+)
+SELECT
+ token,
+ size_bucket,
+ COUNT(*) AS tx_count,
+ SUM(tx_size_tokens) AS volume_tokens
+FROM bucketed
+GROUP BY 1, 2
+ORDER BY size_bucket, token;
